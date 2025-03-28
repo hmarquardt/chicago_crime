@@ -1,286 +1,252 @@
 # Save this script as e.g., chicago_crime_app.py
 # Run using: streamlit run chicago_crime_app.py
 
-from datetime import datetime, timedelta
-
-import pandas as pd
-import plotly.express as px
-import requests
 import streamlit as st
+import pandas as pd
+import requests
+import plotly.express as px
+import pydeck as pdk
+from datetime import datetime, timedelta
+import numpy as np # Keep NumPy for potential checks if needed later
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="Chicago Crime Data Explorer")
 
 DATA_URL_TEMPLATE = "https://data.cityofchicago.org/resource/t7ek-mgzi.json"
-# Fetch a larger limit initially, focused on recent years using Socrata Query Language ($where)
-# Let's fetch data from Jan 1, 2023 onwards to have a good base for analysis
-# Adjust the start date if needed for more/less data
 START_DATE_QUERY = "2023-01-01T00:00:00.000"
 QUERY_PARAMS = f"?$limit=100000&$where=date > '{START_DATE_QUERY}'"
 FULL_DATA_URL = DATA_URL_TEMPLATE + QUERY_PARAMS
-
+MAP_POINTS_LIMIT = 1000
 
 # --- Data Loading ---
-@st.cache_data(ttl=3600)  # Cache data for 1 hour
+@st.cache_data(ttl=3600)
 def load_data(url):
     """Fetches data from the Socrata API and returns a Pandas DataFrame."""
     try:
-        response = requests.get(url, timeout=60)  # Increased timeout
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
         data = response.json()
         df = pd.DataFrame(data)
 
         # --- Basic Data Cleaning ---
-        # Convert date column to datetime objects
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        # Convert coordinates to numeric, coercing errors
-        df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
-        df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
-        # Convert boolean fields
-        df["arrest"] = df["arrest"].astype(bool)
-        df["domestic"] = df["domestic"].astype(bool)
-        # Extract useful date parts
-        df["year"] = df["date"].dt.year
-        df["month"] = df["date"].dt.month
-        df["day_of_week"] = df["date"].dt.day_name()
-        df["hour"] = df["date"].dt.hour
-        # Drop rows with invalid dates or coordinates needed for core features
-        df.dropna(
-            subset=["date", "latitude", "longitude", "primary_type", "community_area"],
-            inplace=True,
-        )
-        # Ensure community_area is treated as string/object for filtering
-        df["community_area"] = df["community_area"].astype(str)
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
+        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
+        df['arrest'] = df['arrest'].astype(bool)
+        df['domestic'] = df['domestic'].astype(bool)
+        df['year'] = df['date'].dt.year
+        df['month'] = df['date'].dt.month
+        df['day_of_week'] = df['date'].dt.day_name()
+        df['hour'] = df['date'].dt.hour
+        # Format date string for tooltip
+        df['date_str'] = df['date'].apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else 'N/A')
+
+        # Ensure essential text columns for tooltip exist and fill NA
+        tooltip_text_cols = ['block', 'primary_type', 'description', 'location_description']
+        for col in tooltip_text_cols:
+             if col not in df.columns:
+                 df[col] = 'N/A'
+             df[col] = df[col].fillna('N/A')
+
+        # Drop rows with invalid essential data (including NaNs from coordinate conversion)
+        df.dropna(subset=['date', 'latitude', 'longitude', 'primary_type', 'community_area'], inplace=True)
+        df['community_area'] = df['community_area'].astype(str)
 
         return df
     except requests.exceptions.RequestException as e:
         st.error(f"Error fetching data: {e}")
-        return pd.DataFrame()  # Return empty DataFrame on error
+        return pd.DataFrame()
     except Exception as e:
         st.error(f"An error occurred during data processing: {e}")
+        st.exception(e)
         return pd.DataFrame()
 
-
 # --- Main App Logic ---
-st.title("Chicago Crime Data Explorer 🏙️")  # Changed title to English
+st.title("Chicago Crime Data Explorer 🏙️")
 st.markdown("""
 Explore recent crime data reported in Chicago. Data is sourced from the
 [City of Chicago Data Portal](https://data.cityofchicago.org/Public-Safety/Crimes-2001-to-Present/ijzp-q8t2).
 *Note: 2025 data might be limited or unavailable.*
 """)
 
-# Load data with spinner
 with st.spinner("Fetching latest crime data... Please wait."):
     df_full = load_data(FULL_DATA_URL)
 
 if df_full.empty:
     st.warning("Could not load data. Please check the data source or try again later.")
-    st.stop()  # Stop execution if data loading failed
+    st.stop()
 
 # --- Sidebar Filters ---
-st.sidebar.header("📊 Filters")  # Changed header to English
-
-# Date Range Filter
-min_date = df_full["date"].min().date()
-max_date = df_full["date"].max().date()
-# Default: Last 90 days or full range if less than 90 days
+st.sidebar.header("📊 Filters")
+min_date = df_full['date'].min().date()
+max_date = df_full['date'].max().date()
 default_start_date = max(min_date, max_date - timedelta(days=90))
-
 date_range = st.sidebar.date_input(
-    "📅 Select Date Range",  # Changed label to English
-    value=(default_start_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
+    "📅 Select Date Range", value=(default_start_date, max_date),
+    min_value=min_date, max_value=max_date,
 )
+start_date = datetime.min.date(); end_date = datetime.max.date()
+if len(date_range) == 2: start_date, end_date = date_range
+else: st.sidebar.warning("Please select a start and end date."); start_date, end_date = default_start_date, max_date
 
-# Ensure date_range has two values
-start_date = datetime.min.date()
-end_date = datetime.max.date()
-if len(date_range) == 2:
-    start_date = date_range[0]
-    end_date = date_range[1]
-else:
-    st.sidebar.warning(
-        "Please select a start and end date."
-    )  # Changed warning to English
-    # Use default range if selection is incomplete
-    start_date = default_start_date
-    end_date = max_date
-
-
-# Crime Type Filter
-all_crime_types = sorted(df_full["primary_type"].unique())
+all_crime_types = sorted(df_full['primary_type'].unique())
 selected_crime_types = st.sidebar.multiselect(
-    "🔪 Select Crime Type(s)",  # Changed label to English
-    options=all_crime_types,
-    default=all_crime_types[
-        :5
-    ],  # Default to top 5 for brevity, or all_crime_types for all
+    "🔪 Select Crime Type(s)", options=all_crime_types, default=all_crime_types[:5]
 )
-
-# Community Area Filter (Replacing Zip Code)
-st.sidebar.markdown(
-    "--- \n *Note: Zip Code data not directly available. Using Community Area instead.*"
-)
-# Convert community area numbers to string for proper filtering if needed, handled in load_data
-all_areas = sorted(
-    df_full["community_area"].unique(),
-    key=lambda x: float(x) if x.replace(".", "", 1).isdigit() else float("inf"),
-)  # Sort numerically
+st.sidebar.markdown("--- \n *Note: Zip Code data not directly available. Using Community Area instead.*")
+all_areas = sorted(df_full['community_area'].unique(), key=lambda x: float(x) if x.replace('.','',1).isdigit() else float('inf'))
 selected_areas = st.sidebar.multiselect(
-    "📍 Select Community Area(s)",  # Changed label to English
-    options=all_areas,
-    default=[],  # Default to none selected means all areas initially
+    "📍 Select Community Area(s)", options=all_areas, default=[]
 )
-
-# Arrest Filter
 arrest_filter = st.sidebar.radio(
-    "⚖️ Arrest Status",  # Changed label to English
-    options=["All", "Arrest Made", "No Arrest"],
-    index=0,  # Default to 'All'
+    "⚖️ Arrest Status", options=['All', 'Arrest Made', 'No Arrest'], index=0
 )
-
 
 # --- Filter Data ---
-# Convert selected dates to datetime for comparison
-start_datetime = pd.to_datetime(start_date)
-# Add one day to end_date and convert to datetime to include the full end day
-end_datetime = pd.to_datetime(end_date) + timedelta(days=1)
-
-# Apply filters sequentially
-df_filtered = df_full[
-    (df_full["date"] >= start_datetime) & (df_full["date"] < end_datetime)
-]
-
-if selected_crime_types:
-    df_filtered = df_filtered[df_filtered["primary_type"].isin(selected_crime_types)]
-
-if selected_areas:
-    df_filtered = df_filtered[df_filtered["community_area"].isin(selected_areas)]
-
-if arrest_filter == "Arrest Made":
-    df_filtered = df_filtered[df_filtered["arrest"] == True]
-elif arrest_filter == "No Arrest":
-    df_filtered = df_filtered[df_filtered["arrest"] == False]
+start_datetime = pd.to_datetime(start_date); end_datetime = pd.to_datetime(end_date) + timedelta(days=1)
+df_filtered = df_full.copy()
+df_filtered = df_filtered[(df_filtered['date'] >= start_datetime) & (df_filtered['date'] < end_datetime)]
+if selected_crime_types: df_filtered = df_filtered[df_filtered['primary_type'].isin(selected_crime_types)]
+if selected_areas: df_filtered = df_filtered[df_filtered['community_area'].isin(selected_areas)]
+if arrest_filter == 'Arrest Made': df_filtered = df_filtered[df_filtered['arrest'] == True]
+elif arrest_filter == 'No Arrest': df_filtered = df_filtered[df_filtered['arrest'] == False]
 
 # --- Display Results ---
-st.header(
-    f"📊 Analysis Results ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})"
-)  # Changed header to English
-st.write(
-    f"Found **{len(df_filtered):,}** crimes matching your criteria."
-)  # Changed text to English
+st.header(f"📊 Analysis Results ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})")
+st.write(f"Found **{len(df_filtered):,}** crimes matching your criteria.")
 
-# Expandable Dataframe
-with st.expander("View Raw Data Table (Filtered)"):  # Changed label to English
-    st.dataframe(df_filtered)
+with st.expander("View Raw Data Table (Filtered)"):
+    if not df_filtered.empty: st.dataframe(df_filtered)
+    else: st.write("No data matches the current filters.")
 
-# Expandable Map
-with st.expander(
-    "View Crime Location Map (Limited to 500 points)"
-):  # Changed label to English
-    if not df_filtered.empty:
-        map_data = df_filtered[["latitude", "longitude"]].dropna()
-        if len(map_data) > 500:
-            st.info(
-                f"Too many points ({len(map_data)}) to display on map. Showing the first 500."
-            )  # Changed info message to English
-            map_data = map_data.head(500)
+# --- Prepare Map Data (Outside Expander) ---
+map_data = pd.DataFrame() # Initialize empty
 
-        if not map_data.empty:
-            st.map(map_data)
-        else:
-            st.warning(
-                "No valid geographic coordinates available for the filtered data."
-            )  # Changed warning to English
+if not df_filtered.empty:
+    # Select all columns needed for the detailed tooltip
+    cols_for_map = ['latitude', 'longitude', 'primary_type', 'description', 'block', 'date_str', 'arrest']
+    available_cols = [col for col in cols_for_map if col in df_filtered.columns]
+    map_data = df_filtered[available_cols].copy()
+
+    # Drop rows with missing coordinates (essential for plotting)
+    map_data.dropna(subset=['latitude', 'longitude'], inplace=True)
+
+    # Ensure text columns for tooltip are strings and NA filled
+    tooltip_text_cols_prep = ['primary_type', 'description', 'block', 'date_str']
+    for col in tooltip_text_cols_prep:
+        if col in map_data.columns:
+            map_data[col] = map_data[col].fillna('N/A').astype(str)
+        else: # Should not happen if load_data ran correctly, but safety check
+            map_data[col] = 'N/A'
+
+    # Ensure arrest column is present (should be bool from load_data)
+    if 'arrest' not in map_data.columns:
+        map_data['arrest'] = False # Default if somehow missing
+
+    # Apply limit after cleaning
+    if len(map_data) > MAP_POINTS_LIMIT:
+        # Removed the st.info message from here, limit applied silently now
+        map_data = map_data.head(MAP_POINTS_LIMIT)
+
+
+# --- Map Expander (Using Prepared map_data) ---
+with st.expander(f"View Crime Location Map (Limited to {MAP_POINTS_LIMIT} points)"):
+    if not map_data.empty:
+        try:
+            valid_lat = map_data['latitude'].dropna()
+            valid_lon = map_data['longitude'].dropna()
+            if not valid_lat.empty and not valid_lon.empty:
+                mid_lat = valid_lat.median()
+                mid_lon = valid_lon.median()
+            else:
+                mid_lat, mid_lon = 41.88, -87.63 # Default Chicago coordinates
+
+            # --- Detailed HTML Tooltip Config ---
+            tooltip_config = {
+                "html": "<b>Type:</b> {primary_type}<br/>"
+                        "<b>Description:</b> {description}<br/>"
+                        "<b>Location:</b> {block}<br/>"
+                        "<b>Date:</b> {date_str}<br/>"
+                        "<b>Arrest:</b> {arrest}",
+                "style": {
+                    "backgroundColor": "rgba(60, 60, 60, 0.8)",
+                    "color": "white",
+                    "padding": "5px",
+                    "border-radius": "3px"
+                }
+            }
+
+            layer = pdk.Layer(
+                'ScatterplotLayer',
+                data=map_data, # Use the prepared map_data
+                get_position='[longitude, latitude]',
+                get_color='[200, 30, 0, 160]',
+                get_radius=50,
+                radius_min_pixels=2,
+                radius_max_pixels=50,
+                pickable=True,
+                auto_highlight=True
+            )
+            view_state = pdk.ViewState(
+                latitude=mid_lat,
+                longitude=mid_lon,
+                zoom=11,
+                pitch=45
+            )
+            deck = pdk.Deck(
+                layers=[layer],
+                initial_view_state=view_state,
+                map_style='mapbox://styles/mapbox/light-v9',
+                tooltip=tooltip_config # Use the detailed HTML tooltip
+            )
+
+            st.pydeck_chart(deck)
+            st.caption("Hover over red points for crime details.")
+
+        except Exception as e:
+            st.error("An error occurred while rendering the map:")
+            st.exception(e)
     else:
-        st.warning(
-            "No data available to display the map."
-        )  # Changed warning to English
+        st.warning("No map data available to display based on filters and processing.")
+
 
 # --- Visualizations ---
-st.header("📈 Visualizations")  # Changed header to English
-
+st.header("📈 Visualizations")
 if df_filtered.empty:
-    st.warning(
-        "No data for the selected filters, visualizations cannot be generated."
-    )  # Changed warning to English
+    st.warning("No data for the selected filters, visualizations cannot be generated.")
 else:
-    # Visualization 1: Crime Trends Over Time
-    st.subheader("Crime Trends Over Time")  # Changed subheader to English
-    crimes_over_time = (
-        df_filtered.set_index("date").resample("D").size().reset_index(name="count")
-    )
-    fig_time = px.line(
-        crimes_over_time,
-        x="date",
-        y="count",
-        title="Daily Crime Count",  # Changed title to English
-        labels={"date": "Date", "count": "Number of Crimes"},
-    )  # Changed labels to English
-    st.plotly_chart(fig_time, use_container_width=True)
+    try:
+        # (Visualization code remains the same)
+        st.subheader("Crime Trends Over Time")
+        crimes_over_time = df_filtered.set_index('date').resample('D').size().reset_index(name='count')
+        fig_time = px.line(crimes_over_time, x='date', y='count', title="Daily Crime Count", labels={'date': 'Date', 'count': 'Number of Crimes'})
+        st.plotly_chart(fig_time, use_container_width=True)
 
-    # Visualization 2: Top Crime Types
-    st.subheader("Most Common Crime Types")  # Changed subheader to English
-    crime_counts = df_filtered["primary_type"].value_counts().reset_index()
-    crime_counts.columns = ["primary_type", "count"]
-    fig_types = px.bar(
-        crime_counts.head(15),
-        x="count",
-        y="primary_type",
-        orientation="h",
-        title="Top 15 Crime Types (by Frequency)",  # Changed title to English
-        labels={"primary_type": "Crime Type", "count": "Number of Crimes"},
-    )  # Changed labels to English
-    fig_types.update_layout(yaxis={"categoryorder": "total ascending"})
-    st.plotly_chart(fig_types, use_container_width=True)
+        st.subheader("Most Common Crime Types")
+        crime_counts = df_filtered['primary_type'].value_counts().reset_index(); crime_counts.columns = ['primary_type', 'count']
+        fig_types = px.bar(crime_counts.head(15), x='count', y='primary_type', orientation='h', title="Top 15 Crime Types (by Frequency)", labels={'primary_type': 'Crime Type', 'count': 'Number of Crimes'})
+        fig_types.update_layout(yaxis={'categoryorder':'total ascending'}); st.plotly_chart(fig_types, use_container_width=True)
 
-    # Visualization 3: Crimes by Hour of Day
-    st.subheader("Crimes by Hour of Day")  # Changed subheader to English
-    crimes_by_hour = df_filtered["hour"].value_counts().sort_index().reset_index()
-    crimes_by_hour.columns = ["hour", "count"]
-    fig_hour = px.bar(
-        crimes_by_hour,
-        x="hour",
-        y="count",
-        title="Crime Count by Hour",  # Changed title to English
-        labels={"hour": "Hour of Day (0-23)", "count": "Number of Crimes"},
-    )  # Changed labels to English
-    st.plotly_chart(fig_hour, use_container_width=True)
+        st.subheader("Crimes by Hour of Day")
+        crimes_by_hour = df_filtered['hour'].value_counts().sort_index().reset_index(); crimes_by_hour.columns = ['hour', 'count']
+        fig_hour = px.bar(crimes_by_hour, x='hour', y='count', title="Crime Count by Hour", labels={'hour': 'Hour of Day (0-23)', 'count': 'Number of Crimes'})
+        st.plotly_chart(fig_hour, use_container_width=True)
 
-    # Visualization 4: Crimes by Community Area
-    st.subheader("Crimes by Community Area")  # Changed subheader to English
-    # Only show if specific areas weren't selected, or show selected ones
-    if not selected_areas or len(selected_areas) > 1:
-        area_counts = df_filtered["community_area"].value_counts().reset_index()
-        area_counts.columns = ["community_area", "count"]
-        # Sort numerically if possible
-        area_counts["community_area_num"] = pd.to_numeric(
-            area_counts["community_area"], errors="coerce"
-        )
-        area_counts = area_counts.sort_values(
-            by="community_area_num", ascending=True
-        ).head(25)  # Show top 25 areas
+        st.subheader("Crimes by Community Area")
+        if not selected_areas or len(selected_areas) > 1:
+            area_counts = df_filtered['community_area'].value_counts().reset_index(); area_counts.columns = ['community_area', 'count']
+            try:
+                area_counts['community_area_num'] = pd.to_numeric(area_counts['community_area']); area_counts = area_counts.sort_values(by='community_area_num', ascending=True).head(25)
+            except ValueError: area_counts = area_counts.sort_values(by='count', ascending=False).head(25)
+            fig_area = px.bar(area_counts, x='count', y='community_area', orientation='h', title="Crimes in Top 25 Community Areas (by Frequency)", labels={'community_area': 'Community Area', 'count': 'Number of Crimes'})
+            fig_area.update_layout(yaxis={'categoryorder':'total ascending'}); st.plotly_chart(fig_area, use_container_width=True)
+        elif len(selected_areas) == 1: st.info(f"Displaying data for Community Area {selected_areas[0]} only.")
 
-        fig_area = px.bar(
-            area_counts,
-            x="count",
-            y="community_area",
-            orientation="h",
-            title="Crimes in Top 25 Community Areas (by Frequency)",  # Changed title to English
-            labels={"community_area": "Community Area", "count": "Number of Crimes"},
-        )  # Changed labels to English
-        fig_area.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_area, use_container_width=True)
-    elif len(selected_areas) == 1:
-        st.info(
-            f"Displaying data for Community Area {selected_areas[0]} only."
-        )  # Changed info message to English
-
+    except Exception as e:
+        st.error(f"An error occurred while generating visualizations: {e}")
+        st.exception(e)
 
 # --- Footer ---
 st.markdown("---")
-st.markdown(
-    f"*Data last fetched: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*"
-)  # Changed text to English
-st.markdown(f"*Data URL used: `{DATA_URL_TEMPLATE}`*")  # Changed text to English
+st.markdown(f"*Data last fetched: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+st.markdown(f"*Data URL used: `{DATA_URL_TEMPLATE}`*")
